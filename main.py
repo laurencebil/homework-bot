@@ -1,232 +1,88 @@
-# main.py
-# Multi-word subjects, grouping, persistent JSON storage, remove-by-index, and a tiny Flask keepalive.
-
+import discord
+from discord.ext import commands
 import os
 import json
-import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 from dateutil import parser
 
-import discord
-from discord.ext import commands
-from flask import Flask
-
-# -------------------------
-# Basic config & constants
-# -------------------------
-HOMEWORK_FILE = "homework.json"
-LOCAL_TZ = pytz.timezone("America/Los_Angeles")  # El Dorado Hills / Pacific
-TOKEN = os.getenv("TOKEN")
-ALLOWED_USER_ID = int(os.getenv("ALLOWED_USER_ID", "0"))
-
-# -------------------------
-# Tiny web server (keepalive for Render/Replit)
-# -------------------------
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return "✅ Homework bot is running."
-
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
-
-# run Flask in background so the Discord bot can run too
-threading.Thread(target=run_flask, daemon=True).start()
-
-# -------------------------
-# Persistence helpers
-# -------------------------
-def load_state():
-    if not os.path.exists(HOMEWORK_FILE):
-        state = {"homework": [], "last_updated": 0}
-        save_state(state)
-        return state
-    try:
-        with open(HOMEWORK_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        # normalize older formats
-        if isinstance(data, list):
-            data = {"homework": data, "last_updated": 0}
-        if "homework" not in data:
-            data["homework"] = []
-        if "last_updated" not in data:
-            data["last_updated"] = 0
-        return data
-    except Exception:
-        state = {"homework": [], "last_updated": 0}
-        save_state(state)
-        return state
-
-def save_state(state):
-    with open(HOMEWORK_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2)
-
-def now_epoch():
-    return int(datetime.now(tz=pytz.UTC).timestamp())
-
-def epoch_from_dt(dt):
-    return int(dt.astimezone(pytz.UTC).timestamp())
-
-def dt_from_epoch(epoch):
-    return datetime.fromtimestamp(int(epoch), tz=pytz.UTC).astimezone(LOCAL_TZ)
-
-# load initial state
-state = load_state()
-
-# -------------------------
-# Discord bot setup
-# -------------------------
+# ---- Setup ----
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
+# Timezone for El Dorado Hills
+LOCAL_TZ = pytz.timezone("America/Los_Angeles")
+HOMEWORK_FILE = "homework.json"
+
+# Load/save helpers
+def load_homework():
+    try:
+        with open(HOMEWORK_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+def save_homework(data):
+    with open(HOMEWORK_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+homework = load_homework()
+
+# ---- Events ----
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
-    print(f"Loaded {len(state['homework'])} homework items. last_updated={state.get('last_updated')}")
 
-# -------------------------
-# addhw: accepts multi-word subject and flexible date at the end
-# Usage examples:
-#   !addhw English Sadlier Unit 2 test / 2025-10-10 19:00
-#   !addhw English Sadlier Unit 2 test 2025-10-10 19:00
-#   !addhw English Sadlier Unit 2 test 10/10/25 7pm
-# If no date supplied, default = today at 11:59pm local time.
-# -------------------------
-@bot.command(name="addhw")
-async def addhw(ctx, *, text: str):
-    if ctx.author.id != ALLOWED_USER_ID:
-        await ctx.send("🚫 Only my creator can add homework.")
-        return
+# ---- Commands ----
+@bot.command()
+async def addhw(ctx, subject: str, *, due: str):
+    """Add homework with due date"""
+    try:
+        due_dt = parser.parse(due, fuzzy=True)
+        due_dt = LOCAL_TZ.localize(due_dt)
 
-    text = text.strip()
-    subject = None
-    due_str = None
+        homework.append({"subject": subject, "due": due_dt.isoformat()})
+        save_homework(homework)
 
-    # Option A: explicit separator " / " -> subject / due
-    if " / " in text:
-        subject, due_str = text.split(" / ", 1)
-    else:
-        # Option B: try to guess date at end by testing last k tokens
-        tokens = text.split()
-        subject = text  # fallback: whole text is subject, no due
-        due_str = None
-        # try last 1..7 tokens as a date/time
-        for k in range(1, min(8, len(tokens)+1)):
-            candidate_due = " ".join(tokens[-k:])
-            candidate_sub = " ".join(tokens[:-k]) or tokens[-k]
-            try:
-                # verify candidate_due is parseable as a date/time
-                _ = parser.parse(candidate_due, fuzzy=False)
-                subject = candidate_sub
-                due_str = candidate_due
-                break
-            except Exception:
-                continue
+        await ctx.send(f"✅ Added: **{subject}** (due {discord.utils.format_dt(due_dt, 'F')}, {discord.utils.format_dt(due_dt, 'R')})")
 
-    # default due = tonight 11:59pm local
-    now_local = datetime.now(LOCAL_TZ)
-    if due_str:
-        try:
-            parsed = parser.parse(due_str, fuzzy=True)
-            if parsed.tzinfo is None:
-                parsed = LOCAL_TZ.localize(parsed)
-            # if parsed time is earlier than now and the user probably gave a time-only
-            if parsed < now_local:
-                # if user gave only time or gave a date earlier than now, for safety we keep given date (could be past) --
-                # Optionally you could bump to next day for time-only inputs; keep current behavior to respect user's date.
-                pass
-            due_dt = parsed
-        except Exception as e:
-            await ctx.send("⚠️ Couldn't read the date/time. Try: `Subject / 2025-10-10 19:00` or `Subject 10/10/25 7pm`.")
-            print("parse error:", e)
-            return
-    else:
-        due_dt = now_local.replace(hour=23, minute=59, second=0, microsecond=0)
+    except Exception as e:
+        await ctx.send("⚠️ Couldn't read the date/time. Try formats like `10/5/25 7pm` or `Oct 5 7pm`.")
+        print(e)
 
-    # store as epoch seconds and add metadata
-    epoch = epoch_from_dt(due_dt)
-    entry = {
-        "subject": subject.strip(),
-        "due": epoch,
-        "added_by": ctx.author.id,
-        "added_at": now_epoch()
-    }
-    state["homework"].append(entry)
-    state["last_updated"] = now_epoch()
-    save_state(state)
-
-    await ctx.send(f"✅ Added: **{subject.strip()}** — due <t:{epoch}:F> (<t:{epoch}:R>)")
-
-# -------------------------
-# hwlist: show grouped by subject but numbered so removal uses that number
-# -------------------------
-@bot.command(name="hwlist")
+@bot.command()
 async def hwlist(ctx):
-    if not state["homework"]:
-        if state.get("last_updated"):
-            await ctx.send(f"📭 No homework right now.\n_Last updated: <t:{state['last_updated']}:R>_")
+    """List all homework"""
+    if not homework:
+        await ctx.send("📘 No homework currently!")
+        return
+
+    msg = "📚 **Homework List:**\n"
+    for i, hw in enumerate(homework, 1):
+        due_dt = parser.parse(hw["due"])
+        msg += f"{i}. **{hw['subject']}** — due {discord.utils.format_dt(due_dt, 'F')} ({discord.utils.format_dt(due_dt, 'R')})\n"
+
+    await ctx.send(msg)
+
+@bot.command()
+async def hwremove(ctx, *, subject: str):
+    """Remove a homework item by exact subject name"""
+    global homework
+    found = False
+    new_homework = []
+    for hw in homework:
+        if hw["subject"].lower() == subject.lower():
+            found = True
         else:
-            await ctx.send("📭 No homework right now.")
-        return
+            new_homework.append(hw)
 
-    # build groups while keeping the original indices
-    groups = {}
-    for i, item in enumerate(state["homework"], start=1):
-        subj = item.get("subject", "No Subject")
-        groups.setdefault(subj, []).append((i, item))
+    if found:
+        homework[:] = new_homework
+        save_homework(homework)
+        await ctx.send(f"🗑️ Removed homework: **{subject}**")
+    else:
+        await ctx.send(f"❌ No homework found named **{subject}**")
 
-    lines = ["📘 **Homework:**"]
-    for subj, items in groups.items():
-        lines.append(f"\n**{subj}**")
-        for idx, it in items:
-            due_epoch = it["due"]
-            lines.append(f"{idx}. due <t:{due_epoch}:R> (<t:{due_epoch}:F>)")
-    if state.get("last_updated"):
-        lines.append(f"\n🕒 _Last updated: <t:{state['last_updated']}:R>_")
-    await ctx.send("\n".join(lines))
-
-# -------------------------
-# done / removehw: remove by the numeric index shown in hwlist
-# -------------------------
-@bot.command(name="done")
-async def done(ctx, idx: int):
-    if ctx.author.id != ALLOWED_USER_ID:
-        await ctx.send("🚫 Only my creator can remove homework.")
-        return
-    if idx < 1 or idx > len(state["homework"]):
-        await ctx.send("⚠️ Invalid index. Use `!hwlist` to see the numbers.")
-        return
-    removed = state["homework"].pop(idx - 1)
-    state["last_updated"] = now_epoch()
-    save_state(state)
-    await ctx.send(f"✅ Removed: **{removed.get('subject','unknown')}**")
-
-# alias
-@bot.command(name="removehw")
-async def removehw(ctx, idx: int):
-    await done.callback(ctx, idx)
-
-# -------------------------
-# clear all homework
-# -------------------------
-@bot.command(name="clearhw")
-async def clearhw(ctx):
-    if ctx.author.id != ALLOWED_USER_ID:
-        await ctx.send("🚫 Only my creator can clear homework.")
-        return
-    state["homework"].clear()
-    state["last_updated"] = now_epoch()
-    save_state(state)
-    await ctx.send("🗑️ All homework cleared.")
-
-# -------------------------
-# Run the bot
-# -------------------------
-if not TOKEN:
-    print("ERROR: TOKEN environment variable not set. Set TOKEN in your Render/Replit secrets.")
-else:
-    bot.run(TOKEN)
+# ---- Run ----
+bot.run(os.getenv("TOKEN"))
