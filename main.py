@@ -1,4 +1,3 @@
-
 # === Keep Render Web Service alive (simple web server) ===
 import os
 from flask import Flask
@@ -97,7 +96,6 @@ async def addhw(ctx, *, text: str):
             candidate_subject = " ".join(tokens[:-k]) or tokens[-k]  # fallback if nothing left
             try:
                 parsed = parser.parse(candidate_due, fuzzy=False)
-                # parsed might be a date even if ambiguous; accept it
                 subject = candidate_subject
                 due_str = candidate_due
                 break
@@ -111,11 +109,8 @@ async def addhw(ctx, *, text: str):
             parsed = parser.parse(due_str, fuzzy=True)
             if parsed.tzinfo is None:
                 parsed = LOCAL_TZ.localize(parsed)
-            # if parsed < now, assume next day (only if date/time likely today)
+            # if parsed < now, assume next day for time-only entries
             if parsed < now:
-                # only bump by day if no explicit date was given (heuristic)
-                # we won't change parsed if it included month/day/year
-                # simple heuristic: if due_str contains digits but no '/', assume time only - tricky
                 if "/" not in due_str and any(ch.isdigit() for ch in due_str):
                     parsed += timedelta(days=1)
             due_dt = parsed
