@@ -36,23 +36,35 @@ intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ---- Persistence helpers ----
-def load_homework():
+def load_state():
+    """Return dict: { 'homework': [ {subject, due}, ... ], 'last_updated': epoch_int }"""
     if not os.path.exists(HOMEWORK_FILE):
-        save_homework([])  # create file
-        return []
+        state = {"homework": [], "last_updated": 0}
+        save_state(state)
+        return state
     try:
         with open(HOMEWORK_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            # expect list of {"subject": str, "due": int(epoch_seconds_utc)}
+            # Backwards-compat: if the file contains a list (old format), convert it
+            if isinstance(data, list):
+                return {"homework": data, "last_updated": 0}
+            # ensure keys exist
+            if "homework" not in data:
+                data["homework"] = []
+            if "last_updated" not in data:
+                data["last_updated"] = 0
             return data
     except Exception:
-        return []
+        # if corrupt, reset
+        state = {"homework": [], "last_updated": 0}
+        save_state(state)
+        return state
 
-def save_homework(data):
+def save_state(state):
     with open(HOMEWORK_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
+        json.dump(state, f, indent=2)
 
-homework = load_homework()
+state = load_state()  # state['homework'] and state['last_updated']
 
 # ---- Utilities ----
 def epoch_from_dt(dt):
@@ -63,11 +75,16 @@ def dt_from_epoch(epoch):
     # return aware datetime in local timezone
     return datetime.fromtimestamp(int(epoch), tz=pytz.UTC).astimezone(LOCAL_TZ)
 
+def now_epoch():
+    return int(datetime.now(tz=pytz.UTC).timestamp())
+
 # ---- Events ----
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
-    print(f"Loaded {len(homework)} homework items.")
+    print(f"Loaded {len(state['homework'])} homework items.")
+    if state.get("last_updated"):
+        print(f"Last updated (epoch): {state['last_updated']}")
 
 # ---- Commands ----
 
@@ -103,14 +120,14 @@ async def addhw(ctx, *, text: str):
                 continue
 
     # parse due
-    now = datetime.now(LOCAL_TZ)
+    now_local = datetime.now(LOCAL_TZ)
     if due_str:
         try:
             parsed = parser.parse(due_str, fuzzy=True)
             if parsed.tzinfo is None:
                 parsed = LOCAL_TZ.localize(parsed)
             # if parsed < now, assume next day for time-only entries
-            if parsed < now:
+            if parsed < now_local:
                 if "/" not in due_str and any(ch.isdigit() for ch in due_str):
                     parsed += timedelta(days=1)
             due_dt = parsed
@@ -119,23 +136,33 @@ async def addhw(ctx, *, text: str):
             return
     else:
         # default = tonight 11:59pm local
-        due_dt = now.replace(hour=23, minute=59, second=0, microsecond=0)
+        due_dt = now_local.replace(hour=23, minute=59, second=0, microsecond=0)
 
     epoch = epoch_from_dt(due_dt)
-    homework.append({"subject": subject.strip(), "due": epoch})
-    save_homework(homework)
+    state["homework"].append({"subject": subject.strip(), "due": epoch})
+    # update last_updated to current UTC epoch
+    state["last_updated"] = now_epoch()
+    save_state(state)
     await ctx.send(f"✅ Added: **{subject.strip()}** — due <t:{epoch}:R> (<t:{epoch}:F>)")
 
 @bot.command(name="hwlist")
 async def hwlist(ctx):
     now_str = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %I:%M %p")
-    if not homework:
-        await ctx.send(f"📭 No homework right now! (Today: {now_str})")
+    if not state["homework"]:
+        # show last updated if exists
+        if state.get("last_updated"):
+            lu = state["last_updated"]
+            await ctx.send(f"📭 No homework right now! (Today: {now_str})\n_Last updated: <t:{lu}:R> (<t:{lu}:F>)_")
+        else:
+            await ctx.send(f"📭 No homework right now! (Today: {now_str})\n_No updates yet._")
         return
     lines = [f"📅 Today: {now_str}\n\n📘 **Homework:**"]
-    for i, item in enumerate(homework, start=1):
+    for i, item in enumerate(state["homework"], start=1):
         epoch = item["due"]
         lines.append(f"{i}. **{item['subject']}** — due <t:{epoch}:R> (<t:{epoch}:F>)")
+    # last updated footer
+    if state.get("last_updated"):
+        lines.append(f"\n_Last updated: <t:{state['last_updated']}:R> (<t:{state['last_updated']}:F>)_")
     await ctx.send("\n".join(lines))
 
 @bot.command(name="done")
@@ -143,9 +170,10 @@ async def done(ctx, idx: int):
     if ctx.author.id != ALLOWED_USER_ID:
         await ctx.send("🚫 Only my creator can mark homework done.")
         return
-    if 1 <= idx <= len(homework):
-        removed = homework.pop(idx-1)
-        save_homework(homework)
+    if 1 <= idx <= len(state["homework"]):
+        removed = state["homework"].pop(idx-1)
+        state["last_updated"] = now_epoch()
+        save_state(state)
         await ctx.send(f"✅ Removed: **{removed['subject']}**")
     else:
         await ctx.send("⚠️ Invalid number. Use `!hwlist` to see indexes.")
@@ -155,8 +183,9 @@ async def clearhw(ctx):
     if ctx.author.id != ALLOWED_USER_ID:
         await ctx.send("🚫 Only my creator can clear homework.")
         return
-    homework.clear()
-    save_homework(homework)
+    state["homework"].clear()
+    state["last_updated"] = now_epoch()
+    save_state(state)
     await ctx.send("🗑️ All homework cleared!")
 
 # ---- Run ----
