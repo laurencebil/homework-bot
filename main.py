@@ -1,88 +1,115 @@
 import discord
 from discord.ext import commands
-import os
 import json
+import os
 from datetime import datetime
-import pytz
-from dateutil import parser
+from flask import Flask
+import threading
 
-# ---- Setup ----
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Timezone for El Dorado Hills
-LOCAL_TZ = pytz.timezone("America/Los_Angeles")
-HOMEWORK_FILE = "homework.json"
+# =======================
+# Flask web server setup
+# =======================
+app = Flask(__name__)
 
-# Load/save helpers
+@app.route('/')
+def home():
+    return "Homework Bot is running!"
+
+def run_web():
+    app.run(host="0.0.0.0", port=8080)
+
+threading.Thread(target=run_web).start()
+
+# =======================
+# Homework JSON handling
+# =======================
 def load_homework():
-    try:
-        with open(HOMEWORK_FILE, "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
+    if not os.path.exists("homework.json"):
+        with open("homework.json", "w") as f:
+            json.dump([], f)
+    with open("homework.json", "r") as f:
+        return json.load(f)
 
-def save_homework(data):
-    with open(HOMEWORK_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+def save_homework(homework):
+    with open("homework.json", "w") as f:
+        json.dump(homework, f, indent=4)
 
-homework = load_homework()
-
-# ---- Events ----
+# =======================
+# Discord bot commands
+# =======================
 @bot.event
 async def on_ready():
     print(f"✅ Logged in as {bot.user}")
+    await bot.change_presence(activity=discord.Game("Tracking Homework"))
 
-# ---- Commands ----
+# Add homework
 @bot.command()
-async def addhw(ctx, subject: str, *, due: str):
-    """Add homework with due date"""
-    try:
-        due_dt = parser.parse(due, fuzzy=True)
-        due_dt = LOCAL_TZ.localize(due_dt)
-
-        homework.append({"subject": subject, "due": due_dt.isoformat()})
-        save_homework(homework)
-
-        await ctx.send(f"✅ Added: **{subject}** (due {discord.utils.format_dt(due_dt, 'F')}, {discord.utils.format_dt(due_dt, 'R')})")
-
-    except Exception as e:
-        await ctx.send("⚠️ Couldn't read the date/time. Try formats like `10/5/25 7pm` or `Oct 5 7pm`.")
-        print(e)
-
-@bot.command()
-async def hwlist(ctx):
-    """List all homework"""
-    if not homework:
-        await ctx.send("📘 No homework currently!")
+async def addhw(ctx, *, args):
+    parts = args.rsplit(" ", 2)
+    if len(parts) < 2:
+        await ctx.send("⚠️ Please include a task and due date! Example:\n`!addhw English essay 10/10/25`")
         return
 
-    msg = "📚 **Homework List:**\n"
-    for i, hw in enumerate(homework, 1):
-        due_dt = parser.parse(hw["due"])
-        msg += f"{i}. **{hw['subject']}** — due {discord.utils.format_dt(due_dt, 'F')} ({discord.utils.format_dt(due_dt, 'R')})\n"
+    task = parts[0].strip()
+    due_date_str = parts[-1].strip()
 
+    try:
+        due_date = datetime.strptime(due_date_str, "%m/%d/%y")
+    except ValueError:
+        await ctx.send("⚠️ Couldn't read the date! Use format like `10/5/25`.")
+        return
+
+    homework = load_homework()
+    homework.append({
+        "task": task,
+        "due": due_date_str,
+        "added": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    })
+    save_homework(homework)
+    await ctx.send(f"✅ **Added:** {task} — due {due_date.strftime('%A, %B %d, %Y')}")
+
+# List homework
+@bot.command()
+async def hwlist(ctx):
+    homework = load_homework()
+    if not homework:
+        await ctx.send("📭 No homework right now.")
+        return
+
+    msg = "📘 **Homework:**\n"
+    for i, item in enumerate(homework, 1):
+        due_date = datetime.strptime(item["due"], "%m/%d/%y")
+        days_left = (due_date - datetime.now()).days
+        msg += f"{i}. **{item['task']}** — due {due_date.strftime('%A, %B %d, %Y')} ({days_left} days left)\n"
+
+    last_updated = datetime.now().strftime("%A, %B %d, %Y %I:%M %p")
+    msg += f"\n🕒 *Last updated: {last_updated}*"
     await ctx.send(msg)
 
+# Remove homework
 @bot.command()
-async def hwremove(ctx, *, subject: str):
-    """Remove a homework item by exact subject name"""
-    global homework
+async def hwremove(ctx, *, name):
+    name = name.strip().lower()
+    homework = load_homework()
+
     found = False
-    new_homework = []
-    for hw in homework:
-        if hw["subject"].lower() == subject.lower():
+    for item in homework:
+        if item["task"].lower() == name:
+            homework.remove(item)
             found = True
-        else:
-            new_homework.append(hw)
+            break
 
     if found:
-        homework[:] = new_homework
         save_homework(homework)
-        await ctx.send(f"🗑️ Removed homework: **{subject}**")
+        await ctx.send(f"🗑️ Removed **{name}** from homework list.")
     else:
-        await ctx.send(f"❌ No homework found named **{subject}**")
+        await ctx.send(f"⚠️ No homework found with the name **{name}**.")
 
-# ---- Run ----
-bot.run(os.getenv("TOKEN"))
+# =======================
+# Run bot
+# =======================
+bot.run(os.getenv("DISCORD_TOKEN"))
